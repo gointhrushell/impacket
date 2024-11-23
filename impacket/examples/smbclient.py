@@ -25,6 +25,9 @@ import time
 import cmd
 import os
 import ntpath
+import shutil
+import colorama
+import re
 
 from six import PY2
 from impacket.dcerpc.v5 import samr, transport, srvs
@@ -36,6 +39,7 @@ from impacket.smb3structs import FILE_DIRECTORY_FILE, FILE_LIST_DIRECTORY
 
 import charset_normalizer as chardet
 
+ARCHIVES = ('.zip', '.tar', '.tgz', '.7z', '.rar', '.bzip')
 
 class MiniImpacketShell(cmd.Cmd):
     def __init__(self, smbClient, tcpShell=None, outputfile=None):
@@ -65,6 +69,31 @@ class MiniImpacketShell(cmd.Cmd):
         self.completion = []
         self.outputfile = outputfile
 
+    def color_collected(self, remote_path, size):
+        local_path = os.path.join("./loot", remote_path)
+        
+        if not os.path.exists(local_path):
+            return remote_path
+        if not os.stat(local_path).st_size == size:
+            return f"{colorama.Fore.YELLOW}{remote_path}{colorama.Fore.RESET}"
+        return f"{colorama.Fore.GREEN}{remote_path}{colorama.Fore.RESET}"
+        
+    def get_full_path(self, target=None):
+        if target is None:
+            path = os.path.join(self.share, self.pwd.lstrip("/"))
+        else:
+            file_path = os.path.join(self.pwd, target)
+            path = os.path.join(self.share, file_path.lstrip("/"))
+        path = path.replace("\\","/")
+        return os.path.normpath(path)
+    
+    def get_path_no_share(self, target=None):
+        if target is None:
+            return os.path.normpath(self.pwd)
+        file_path = os.path.join(self.pwd, target)
+        path = file_path.replace("\\","/")
+        return os.path.normpath(path)       
+        
     def emptyline(self):
         pass
 
@@ -342,7 +371,9 @@ class MiniImpacketShell(cmd.Cmd):
         self.share = line
         self.tid = self.smb.connectTree(line)
         self.pwd = '\\'
-        self.do_ls('', False)
+        self.do_ls('', True)
+        path = self.get_full_path()
+        self.prompt = f"[{colorama.Fore.LIGHTCYAN_EX}{path}{colorama.Fore.RESET}] "
 
     def complete_cd(self, text, line, begidx, endidx):
         return self.complete_get(text, line, begidx, endidx, include = 2)
@@ -366,6 +397,8 @@ class MiniImpacketShell(cmd.Cmd):
         except SessionError:
             self.pwd = oldpwd
             raise
+        path = self.get_full_path()
+        self.prompt = f"[{colorama.Fore.LIGHTCYAN_EX}{path}{colorama.Fore.RESET}] "
 
     def do_lcd(self, s):
         print(s)
@@ -402,14 +435,24 @@ class MiniImpacketShell(cmd.Cmd):
             of = open(self.outputfile, 'a')
         for f in self.smb.listPath(self.share, pwd):
             if display is True:
+                filename = self.get_full_path(f.get_longname())
+                
+                if f.is_directory() > 0:
+                    flags = f"{colorama.Fore.LIGHTBLACK_EX}drw-rw-rw-{colorama.Fore.RESET}"
+                else:
+                    flags = "-rw-rw-rw-"      
+                    if f.get_longname().endswith(ARCHIVES):
+                        flags = f"{colorama.Fore.LIGHTBLUE_EX}{flags}{colorama.Fore.RESET}"
+                    filename = self.color_collected(filename, f.get_filesize())
+                    
                 if self.outputfile:
                     of.write("%crw-rw-rw- %10d  %s %s" % (
                     'd' if f.is_directory() > 0 else '-', f.get_filesize(), time.ctime(float(f.get_mtime_epoch())),
-                    f.get_longname()) + "\n")
+                    self.get_full_path(f.get_longname())) + "\n")
                 
-                print("%crw-rw-rw- %10d  %s %s" % (
-                'd' if f.is_directory() > 0 else '-', f.get_filesize(), time.ctime(float(f.get_mtime_epoch())),
-                f.get_longname()))
+                print("%s %10d  %s %s" % (
+                flags, f.get_filesize(), time.ctime(float(f.get_mtime_epoch())),
+                filename))
             self.completion.append((f.get_longname(), f.is_directory()))
         if self.outputfile:
             of.close()
@@ -426,27 +469,49 @@ class MiniImpacketShell(cmd.Cmd):
         retList = []
         retFiles = []
         retInt = 0
+        retDirs = 0
+        totalSize = 0
         try:                
             for LINE in self.smb.listPath(self.share, ip):
                 if(LINE.get_longname() == "." or LINE.get_longname() == ".."):
                     pass
                 else:
-                    retInt = retInt + 1
                     print(ip.strip("*").replace("//","/") + LINE.get_longname())
                     if(LINE.is_directory()):
+                        filename = self.color_collected(self.get_full_path( LINE.get_longname()),LINE.get_filesize())
+                        flags = f"{colorama.Fore.LIGHTBLACK_EX}drw-rw-rw-{colorama.Fore.RESET}"   
+                        
+                        print("%s %10d  %s %s" % (
+                        flags, LINE.get_filesize(), time.ctime(float(LINE.get_mtime_epoch())),
+                        filename))                        
+                        
+                        retDirs += 1
                         retval = ip.strip("*").replace("//","/") + LINE.get_longname()
                         retList.append(retval)
                     else:
+                        filename = self.color_collected(self.get_full_path( LINE.get_longname()),LINE.get_filesize())
+                        flags = "-rw-rw-rw-"      
+                        if LINE.get_longname().endswith(ARCHIVES):
+                            flags = f"{colorama.Fore.LIGHTBLUE_EX}{flags}{colorama.Fore.RESET}"         
+                        
+                        print("%s %10d  %s %s" % (
+                        flags, LINE.get_filesize(), time.ctime(float(LINE.get_mtime_epoch())),
+                        filename))                        
+                        
+                        totalSize += LINE.get_filesize()
+                        retInt = retInt + 1                        
                         retval = ip.strip("*").replace("//","/") + LINE.get_longname()
                         retFiles.append(retval)
         except:
             pass
-        return retList,retFiles,retInt
+        return retList,retFiles,retInt,retDirs, totalSize
 
     def do_tree(self, filepath):
         folderList = []
         retList = []
         totalFilesRead = 0
+        totalDirsRead = 0
+        totalSize = 0
         if self.loggedIn is False:
             LOG.error("Not logged in")
             return
@@ -454,32 +519,48 @@ class MiniImpacketShell(cmd.Cmd):
             LOG.error("No share selected")
             return
 
-        filepath = filepath.replace("\\", "/")
-        if not filepath.startswith("/"):
-            filepath = self.pwd.replace("\\", "/")  + "/" + filepath
         if(not filepath.endswith("/*")):
             filepath = filepath + "/*"
-        filepath = os.path.abspath(filepath).replace("//","/")
+        filepath = self.get_path_no_share(filepath)
 
         for LINE in self.smb.listPath(self.share, filepath):
             if(LINE.is_directory()):
                 if(LINE.get_longname() == "." or LINE.get_longname() == ".."):
                     pass
                 else:
-                    totalFilesRead = totalFilesRead + 1 
+                    filename = self.color_collected(self.get_full_path( LINE.get_longname()),LINE.get_filesize())
+                    flags = f"{colorama.Fore.LIGHTBLACK_EX}drw-rw-rw-{colorama.Fore.RESET}"   
+                    
+                    print("%s %10d  %s %s" % (
+                    flags, LINE.get_filesize(), time.ctime(float(LINE.get_mtime_epoch())),
+                    filename))                      
+                    totalDirsRead += 1
                     folderList.append(filepath.strip("*") + LINE.get_longname())
             else:
-                print(filepath.strip("*") + LINE.get_longname())
+                totalFilesRead += 1
+                totalSize += LINE.get_filesize()
+                
+                filename = self.color_collected(self.get_full_path( LINE.get_longname()),LINE.get_filesize())
+                flags = "-rw-rw-rw-"      
+                if LINE.get_longname().endswith(ARCHIVES):
+                    flags = f"{colorama.Fore.LIGHTBLUE_EX}{flags}{colorama.Fore.RESET}"         
+                
+                print("%s %10d  %s %s" % (
+                flags, LINE.get_filesize(), time.ctime(float(LINE.get_mtime_epoch())),
+                filename))
+                
         for ITEM in folderList:
             ITEM = ITEM + "/*"
             try: 
-                retList, retFiles, retInt = self.do_listFiles(self.share,ITEM)
+                retList, retFiles, retInt, retDirs, retSize = self.do_listFiles(self.share,ITEM)
                 for q in retList:
                     folderList.append(q)
-                totalFilesRead = totalFilesRead + retInt
+                totalFilesRead += retInt
+                totalDirsRead += retDirs
+                totalSize += retSize
             except:
                 pass
-        print("Finished - " + str(totalFilesRead) + " files and folders")
+        print(f"\nFinished -  {totalFilesRead} files {totalDirsRead} folders with total of {totalSize} bytes")
 
     def do_rm(self, filename):
         if self.tid is None:
@@ -565,19 +646,44 @@ class MiniImpacketShell(cmd.Cmd):
                     os.remove(filename)
                     raise
                 fh.close()
-
+                
     def do_get(self, filename):
         if self.tid is None:
             LOG.error("No share selected")
             return
         filename = filename.replace('/','\\')
-        fh = open(ntpath.basename(filename),'wb')
+        if not os.path.exists("./loot"):
+            os.mkdir("./loot")
+        local_path = os.path.join("./loot",self.get_full_path(filename))
+        if not os.path.exists(os.path.dirname(local_path)):
+            os.makedirs(os.path.dirname(local_path))
+        
+        if os.path.exists(local_path):
+            def ensure_no_overwrite(path, filename, count=0):
+                if count == 0:
+                    orig_path = os.path.join('./loot', path, f"{filename}")
+                else:
+                    orig_path = os.path.join('./loot', path, f"{count}_{filename}")
+                next_path = os.path.join('./loot', path, f"{count+1}_{filename}")
+                if not os.path.exists(next_path):
+                    shutil.move(orig_path, next_path)                    
+                    return
+                ensure_no_overwrite(path, filename, count+1)                
+                shutil.move(orig_path, next_path)
+                
+
+            ensure_no_overwrite(self.get_full_path(), filename)
+        fh = open(local_path,'wb')
         pathname = ntpath.join(self.pwd,filename)
         try:
+            print(f"Downloading {filename} ... ", end='', flush=True)
             self.smb.getFile(self.share, pathname, fh.write)
-        except:
+            print(f"{colorama.Fore.GREEN}Success{colorama.Fore.RESET}")
+        except Exception as e:
+            print(f"{colorama.Fore.RED}Failed{colorama.Fore.RESET} - {e.getErrorString()[0]}")
             fh.close()
-            os.remove(filename)
+            new_path = os.path.join("./loot",self.get_full_path("failed_"+filename))
+            shutil.move(local_path, new_path)
             raise
         fh.close()
 
